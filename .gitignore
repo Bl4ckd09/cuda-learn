@@ -21,3 +21,6 @@ phase1-matmul/03_coarsened
 phase1-matmul/04_vectorized
 phase1-matmul/05_cublas
 phase1-matmul/benchmark_all
+phase2-elementwise/01_activations
+phase2-elementwise/02_rmsnorm
+phase2-elementwise/03_softmax

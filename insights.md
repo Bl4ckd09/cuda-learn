@@ -92,3 +92,84 @@ When threads in a warp (32 threads) access adjacent memory addresses, the hardwa
 1. **Expose parallelism** — launch enough threads to keep all SMs busy
 2. **Minimize memory traffic** — use shared memory, registers; reduce global reads
 3. **Coalesce memory access** — adjacent threads read adjacent addresses
+
+---
+
+## Phase 2: Elementwise Kernels & Fusion
+
+### Activation Functions: Near-Peak Bandwidth
+Simple elementwise ops like ReLU and GELU are purely **memory-bound** — the arithmetic is trivial compared to the time spent reading/writing global memory. Both achieved **91.5% of peak memory bandwidth** (461 GB/s out of 504 GB/s). This means the kernel is nearly perfectly efficient; the only overhead is launch latency and a tiny bit of instruction fetch. When you see a kernel at 90%+ of peak BW, there's essentially nothing left to optimize — it's already limited by physics (GDDR6X speed).
+
+### Kernel Fusion: Eliminating Memory Round-trips
+The fused bias+GELU kernel demonstrates why fusion matters:
+- **Unfused:** `bias_add` reads X and writes Y (2 passes), then `gelu` reads Y and writes Z (2 passes) = **4 memory passes** = 67 MB
+- **Fused:** Single kernel reads X and writes Z = **2 memory passes** = 34 MB
+- This is a **2x memory traffic reduction**. For training at scale, every unnecessary global memory round-trip is wasted bandwidth.
+
+### RMSNorm: Warp Shuffle vs Shared Memory Reductions
+RMSNorm (used in LLaMA/nanochat instead of LayerNorm) requires a **row-wise reduction** (sum of squares across the hidden dimension). Two approaches:
+- **v1 (shared memory):** Each warp reduces via `__shfl_down_sync`, warp leaders write to shared memory, one warp does final reduction from shared memory.
+- **v2 (warp shuffle only):** Replaces the block-level shared memory step with direct warp shuffles where possible, reducing `__syncthreads()` barriers.
+- **Result:** v2 is **1.23x faster** (1161 GB/s vs 947 GB/s). The speedup comes from avoiding shared memory latency (~20-30 cycles) and synchronization barriers.
+
+### Online Softmax: The Flash Attention Foundation
+Standard softmax requires **three passes** over the data:
+1. Find `max(x)` — needed for numerical stability
+2. Compute `exp(x_i - max)` and `sum(exp)` — the denominator
+3. Normalize: `softmax[i] = exp(x_i - max) / sum`
+
+**Online softmax** (Milakov & Gimelshein, 2018) collapses passes 1+2 into a **single pass** by maintaining a running max `m` and running denominator `d`:
+```
+For each new element x_i:
+    m_new = max(m_old, x_i)
+    d_new = d_old * exp(m_old - m_new) + exp(x_i - m_new)
+```
+The key insight: when the running max changes, the rescaling factor `exp(m_old - m_new)` corrects all previous contributions. This is **THE algorithmic foundation of Flash Attention** — you never need to see the entire row at once. You can process tiles of KV and update running statistics.
+
+### Phase 2 Benchmark Results (RTX 4070)
+| Kernel | Bandwidth | Notes |
+|--------|----------|-------|
+| ReLU | 461 GB/s (91.5% peak) | Pure memory-bound, near-optimal |
+| GELU | 461 GB/s (91.5% peak) | tanh approximation adds negligible compute |
+| RMSNorm v1 (smem) | 947 GB/s | Shared memory reduction |
+| RMSNorm v2 (warp) | 1161 GB/s | 1.23x faster with warp shuffles |
+| Softmax v1 (3-pass) | 592 GB/s | Three separate passes |
+| Softmax v2 (2-pass) | 603 GB/s | Fused exp+sum pass |
+| Softmax v3 (online) | 522 GB/s | Single data pass, but more compute per element |
+
+Note: Online softmax (v3) shows slightly lower bandwidth than v1/v2 at D=512. This is because at small dimensions the extra `expf()` calls in the online algorithm dominate. The real win comes at **large dimensions** and when combined with **tiled attention** — where you literally can't fit the whole row in memory and online softmax is the *only* option.
+
+---
+
+## Debugging War Stories
+
+### The `__shfl_down_sync` Warp Deadlock (Phase 2, Softmax v3)
+
+**Symptom:** The softmax kernel hung indefinitely — no output at all, not even `printf` before the kernel launch (due to stdout buffering). The program appeared completely frozen.
+
+**Root cause:** In the cross-warp reduction of the online softmax, the code had:
+```cuda
+// BUG: Only num_warps (8) lanes execute, but mask says all 32 must!
+if (warp_id == 0 && tid < num_warps) {
+    // ...
+    __shfl_down_sync(0xffffffff, val, offset);  // DEADLOCK
+}
+```
+
+The mask `0xffffffff` tells the hardware that **all 32 lanes** in the warp will participate. But the `if` guard meant only lanes 0-7 (num_warps=8) executed the shuffle. The remaining 24 lanes never reached the sync point → **deadlock**.
+
+**Fix:** Let all 32 lanes execute the shuffle, using neutral values for inactive lanes:
+```cuda
+if (warp_id == 0) {
+    local_max = (tid < num_warps) ? smem_max[tid] : -FLT_MAX;  // neutral for max
+    local_sum = (tid < num_warps) ? smem_sum[tid] : 0.0f;       // neutral for sum
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        // ALL 32 lanes participate — inactive ones contribute neutral values
+        float other_max = __shfl_down_sync(0xffffffff, local_max, offset);
+        float other_sum = __shfl_down_sync(0xffffffff, local_sum, offset);
+        // ... combine ...
+    }
+}
+```
+
+**Lesson:** `__shfl_down_sync(0xffffffff, ...)` is a **collective operation** — the mask is a *promise* that all indicated lanes will participate. Breaking that promise causes deadlock, not a soft error. This is one of the most common CUDA bugs and is extremely hard to debug because the hang gives no error message. When in doubt: let all lanes participate and use identity/neutral values for inactive ones.
