@@ -218,3 +218,44 @@ The **real win is memory**: Flash uses O(N*d) vs naive O(N²). At N=2048, d=64: 
 | 2048 | 2.110 | 0.083 | 2.0 MB | 34 MB |
 
 Note: Naive timing excludes softmax (matmuls only). Flash Attention includes everything.
+
+### Why Three Stages of Attention Implementation?
+Each stage teaches something critical:
+1. **Naive (01):** Materializes the full L×L attention matrix S. At L=2048 with FP32, that's 2048²×4 = 16 MB per head. For 12 heads and batch 32, that's **6 GB**. This shows *why* Flash Attention exists: the O(L²) memory wall.
+2. **Fused single-tile (02):** Loads Q, K, V tiles and does everything in one kernel — but with Br=1 (one query row per block). Teaches the online softmax tiling pattern and shared memory management.
+3. **Flash Attention (03):** The real algorithm — process Br query rows × Bc KV tiles, never materializing the full L×L matrix. Uses the online softmax to maintain running statistics. Memory goes from O(L²) to O(L).
+
+### The 8:1 Memory Ratio (Attention vs QKV)
+At N=1024, d=64: the attention matrices (S+P) use 8 MB while Q+K+V+O total only 1 MB. This ratio = N/d. At N=2048 it becomes 32:1. At N=8192 (modern LLMs) it's 128:1. Flash Attention eliminates the N² term entirely, keeping only the O(N*d) term.
+
+### Shared Memory Writes: The Single-Writer Rule
+A recurring bug pattern: when multiple threads write `shared[j] = f(shared[j])` for the SAME j, it's a race condition even if they compute the same value. The hardware may interleave reads and writes across warps unpredictably.
+
+**Pattern:** For any shared memory modification:
+1. **Writes must be partitioned** — each element written by exactly one thread
+2. **Or use a designated writer** — thread 0 handles all updates, others wait
+3. **Always `__syncthreads()` between write and read by different threads**
+
+This bug appeared THREE times in Phase 3:
+- `02_fused_attention`: all threads wrote `scores[j] = expf(...)` → fix: partition j among threads
+- `03_flash_attention`: per-row softmax state in registers → fix: move to shared memory with designated updater
+- `04_flash_attention_backward`: forward-save kernel had same race → fix: thread 0 handles all softmax updates
+
+### Flash Attention Backward: Recomputation Trade-off
+The backward pass **recomputes** attention probabilities P tile-by-tile from Q, K (and saved per-row m, l) rather than storing the full N×N matrix from forward. This is a classic **compute vs memory** trade-off:
+- **Standard backward:** Store P (O(N²) memory), use directly
+- **Flash backward:** Recompute P tiles from Q, K, m, l — O(1) extra memory per tile, ~1.8x total compute vs forward
+
+The **D vector trick:** `D[i] = rowsum(dO[i] * O[i])` is a scalar per row, computed once and stored in O(N). This appears in the softmax backward: `dS[i][j] = P[i][j] * (dP[i][j] - D[i])`. Without D, you'd need to store or recompute `rowsum(P * dP)` per tile, which is much harder.
+
+### Backward Gradient Formulas (for reference)
+Given forward: S = QK^T * scale, P = softmax(S), O = PV
+```
+D[i]    = rowsum(dO[i] * O[i])           -- scalar per row
+dV[j]   = sum_i P[i][j] * dO[i]          -- P^T @ dO
+dP[i][j] = dot(dO[i], V[j])              -- dO @ V^T
+dS[i][j] = P[i][j] * (dP[i][j] - D[i])  -- softmax backward
+dQ[i]   = scale * sum_j dS[i][j] * K[j]  -- dS @ K
+dK[j]   = scale * sum_i dS[i][j] * Q[i]  -- dS^T @ Q
+```
+All computed tile-by-tile in Flash Attention backward, with P recomputed from Q, K, m, l.
