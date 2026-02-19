@@ -2,3 +2,16 @@ reference/
 *.o
 *.out
 *.exe
+
+# Compiled binaries (no extension)
+phase0-foundations/c-review/01_pointers
+phase0-foundations/c-review/02_structs_and_types
+phase0-foundations/c-review/03_macros
+phase0-foundations/c-review/04_cuda_hello
+phase0-foundations/first-kernels/01_thread_indexing
+phase0-foundations/first-kernels/02_vector_add
+phase0-foundations/first-kernels/03_memory_timing
+phase0-foundations/first-kernels/04_naive_matmul
+phase0-foundations/first-kernels/05_nvtx_matmul
+phase0-foundations/first-kernels/06_atomics
+phase0-foundations/first-kernels/07_streams
