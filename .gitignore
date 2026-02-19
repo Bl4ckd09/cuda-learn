@@ -15,3 +15,9 @@ phase0-foundations/first-kernels/04_naive_matmul
 phase0-foundations/first-kernels/05_nvtx_matmul
 phase0-foundations/first-kernels/06_atomics
 phase0-foundations/first-kernels/07_streams
+phase1-matmul/01_naive
+phase1-matmul/02_tiled
+phase1-matmul/03_coarsened
+phase1-matmul/04_vectorized
+phase1-matmul/05_cublas
+phase1-matmul/benchmark_all
