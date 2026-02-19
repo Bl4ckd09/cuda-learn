@@ -259,3 +259,35 @@ dQ[i]   = scale * sum_j dS[i][j] * K[j]  -- dS @ K
 dK[j]   = scale * sum_i dS[i][j] * Q[i]  -- dS^T @ Q
 ```
 All computed tile-by-tile in Flash Attention backward, with P recomputed from Q, K, m, l.
+
+### Multi-Head Batched FP16: Mixed Precision Strategy
+Real Flash Attention (and all modern transformer training) uses **mixed precision**:
+- **Store** Q, K, V, O in FP16 (`__half`) — halves memory and doubles bandwidth
+- **Accumulate** dot products and softmax statistics in FP32 — prevents catastrophic rounding
+
+FP16 has only ~3.3 decimal digits of precision (vs ~7 for FP32). A dot product of d=64 terms in pure FP16 can lose significant accuracy. The fix: accumulate in FP32, convert final result back to FP16 for storage. This is exactly what tensor cores do internally.
+
+### 3D Grid: Launch All Heads in One Kernel
+The multi-head layout `[B, H, N, d]` maps naturally to a 3D CUDA grid:
+```
+dim3 grid(ceil(N/Br), H, B);  // one block per (batch, head, q_tile) triple
+```
+This replaces a host-side loop of B*H separate kernel launches with a **single launch**. Benefits:
+- Eliminates ~5-10μs launch overhead per head (B*H = 48 launches saved)
+- GPU scheduler sees all blocks at once → better SM utilization
+- Combined with FP16: **5.35x total speedup** vs FP32 loop (B=4, H=12, N=512)
+
+### Phase 3.5 Benchmark Results (RTX 4070, B=4, H=12, N=512, d=64)
+| Method | Time | Speedup | Memory (Q+K+V+O) |
+|--------|------|---------|-------------------|
+| FP32 Flash (loop B*H) | 17.96 ms | 1.0x | 24 MB |
+| FP16 Flash (3D grid) | 3.36 ms | 5.35x | 12 MB |
+
+FP16 max error vs CPU reference: 4.94e-05 (well within FP16 precision).
+
+### Production Scale Memory Analysis
+At B=32, H=12, N=2048, d=64:
+- **Flash FP16** (Q+K+V+O): 384 MB
+- **Flash FP32** (Q+K+V+O): 768 MB
+- **Naive attention matrices** (S+P): 12,288 MB = **12.3 GB**
+- Flash FP16 saves **32x** over naive!

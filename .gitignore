@@ -28,3 +28,4 @@ phase3-attention/01_naive_attention
 phase3-attention/02_fused_attention
 phase3-attention/03_flash_attention
 phase3-attention/04_flash_attention_backward
+phase3-attention/05_multihead_fp16
