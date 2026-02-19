@@ -173,3 +173,48 @@ if (warp_id == 0) {
 ```
 
 **Lesson:** `__shfl_down_sync(0xffffffff, ...)` is a **collective operation** — the mask is a *promise* that all indicated lanes will participate. Breaking that promise causes deadlock, not a soft error. This is one of the most common CUDA bugs and is extremely hard to debug because the hang gives no error message. When in doubt: let all lanes participate and use identity/neutral values for inactive ones.
+
+---
+
+## Phase 3: Attention & Flash Attention
+
+### Naive Attention: The O(N²) Memory Wall
+At N=1024, d=64: the attention matrices S and P use 8 MB total — **8x more** than Q+K+V+O combined. This ratio = N/d, so at N=2048 it becomes 32:1, and at N=8192 (common for modern LLMs) it's 128:1. With 12 heads and batch 32, the S+P matrices alone would need **24 GB** at N=8192 — far exceeding most GPU memory. This O(N²) memory scaling is the fundamental problem Flash Attention solves.
+
+### cuBLAS Row-Major for Q@K^T
+To compute S = Q @ K^T with cuBLAS (column-major library) on row-major data:
+```c
+cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            N, N, d, &scale,
+            d_K, d,    // K transposed: OP_T on row-major K gives K^T in the right layout
+            d_Q, d,    // Q: OP_N, row-major with lda=d
+            &beta, d_S, N);
+```
+The cuBLAS naive path (2 matmuls + softmax) is **6.7x faster** than custom naive kernels at N=1024.
+
+### Shared Memory Race Conditions in Fused Attention
+When computing in-place softmax over shared `scores[]` array, having ALL threads write `scores[j] = expf(scores[j] - m_new)` for ALL j is a race condition. Fix: partition writes so each thread handles disjoint j values (`j = tid; j < tile_len; j += blockDim.x`), then `__syncthreads()` before reading.
+
+### Flash Attention: The Per-Row State Problem
+With `blockDim.x = D_HEAD = 64` threads, each thread handles one output dimension. The online softmax state (running max `m` and sum `l`) is per-query-row. If stored in per-thread registers, only the thread assigned to update that row's softmax applies the correction `o_acc *= exp(m_old - m_new)`. Other threads accumulating to the same row never get corrected → wrong output (`-inf`).
+
+**Fix:** Store `m[Br]`, `l[Br]`, and `correction[Br]` in **shared memory**. The softmax-assigned thread writes the correction factor, then ALL threads read it to rescale their accumulators. Also guard against `-inf - (-inf) = NaN` by checking `if (old_m == -FLT_MAX)` and setting correction to 0 instead of `exp(-inf - (-inf))`.
+
+### Flash Attention: Correctness vs Speed
+Our learning implementation is correct (max error 1.49e-07) but ~25x slower than cuBLAS naive. This is expected with only 64 threads/block. Production Flash Attention uses:
+- 128-256 threads with 2D layout
+- Register-tiled matmul for score computation (using WMMA/tensor cores for FP16)
+- Careful shared memory bank conflict avoidance
+- Pipeline prefetching (load next tile while computing current)
+
+The **real win is memory**: Flash uses O(N*d) vs naive O(N²). At N=2048, d=64: Flash needs 2 MB, naive needs 34 MB — a **17x reduction**. This makes long sequences *possible* on limited VRAM, not just faster.
+
+### Phase 3 Benchmark Results (RTX 4070)
+| N | Flash (ms) | Naive cuBLAS (ms) | Flash mem | Naive mem |
+|---|-----------|-------------------|-----------|-----------|
+| 256 | 0.214 | 0.018 | 256 KB | 768 KB |
+| 512 | 0.417 | 0.024 | 512 KB | 2.5 MB |
+| 1024 | 0.821 | 0.035 | 1.0 MB | 9.0 MB |
+| 2048 | 2.110 | 0.083 | 2.0 MB | 34 MB |
+
+Note: Naive timing excludes softmax (matmuls only). Flash Attention includes everything.
