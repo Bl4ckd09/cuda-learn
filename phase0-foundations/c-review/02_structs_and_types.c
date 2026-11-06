@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 /* ---------- Exercise 1: sizeof — know your type sizes ---------- */
@@ -54,24 +55,34 @@ typedef struct {
 } Matrix;
 
 Matrix matrix_create(int rows, int cols) {
+    if (rows <= 0 || cols <= 0 ||
+        (size_t)rows > SIZE_MAX / sizeof(float) / (size_t)cols) {
+        fputs("Invalid matrix dimensions\n", stderr);
+        exit(EXIT_FAILURE);
+    }
     Matrix m;
     m.rows = rows;
     m.cols = cols;
-    m.data = (float *)malloc(rows * cols * sizeof(float));
+    m.data = malloc((size_t)rows * (size_t)cols * sizeof(float));
+    if (!m.data) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
     return m;
 }
 
 void matrix_fill(Matrix *m, float val) {
-    for (int i = 0; i < m->rows * m->cols; i++)
+    size_t count = (size_t)m->rows * (size_t)m->cols;
+    for (size_t i = 0; i < count; i++)
         m->data[i] = val;
 }
 
 float matrix_get(const Matrix *m, int row, int col) {
-    return m->data[row * m->cols + col];  // row-major indexing
+    return m->data[(size_t)row * (size_t)m->cols + (size_t)col];
 }
 
 void matrix_set(Matrix *m, int row, int col, float val) {
-    m->data[row * m->cols + col] = val;
+    m->data[(size_t)row * (size_t)m->cols + (size_t)col] = val;
 }
 
 void matrix_print(const Matrix *m, const char *name) {

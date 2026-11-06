@@ -32,6 +32,7 @@ Matrices in CUDA are flat 1D arrays:
 // matrix[row][col] becomes:
 matrix[row * num_cols + col]
 ```
+Convert dimensions to `size_t` before multiplication. Check the byte count against `SIZE_MAX` before allocation.
 
 ### Error Checking Macro
 ```c
